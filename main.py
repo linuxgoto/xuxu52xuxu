@@ -7,6 +7,9 @@ import platform
 import requests
 import html
 import io
+import socket
+from urllib.parse import quote
+from typing import Optional, Tuple, Dict
 from datetime import datetime
 from configparser import ConfigParser
 from tabulate import tabulate
@@ -73,6 +76,60 @@ USE_WXPUSHER = os.getenv("USE_WXPUSHER", config.get('wxpusher', 'use_wxpusher', 
 APP_TOKEN = os.getenv("APP_TOKEN", config.get('wxpusher', 'app_token', fallback=None))
 TOPIC_ID = os.getenv("TOPIC_ID", config.get('wxpusher', 'topic_id', fallback=None))
 MAX_TOPICS = int(os.getenv("MAX_TOPICS", config.get('settings', 'max_topics', fallback='10')))
+BROWSER = os.getenv("BROWSER", config.get('settings', 'browser', fallback='firefox')).lower()
+
+# 代理配置（可选）
+PROXY_SERVER = os.getenv("PROXY_SERVER", config.get('proxy', 'server', fallback=None))
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", config.get('proxy', 'username', fallback=None))
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", config.get('proxy', 'password', fallback=None))
+
+def _build_requests_proxy_url(server: Optional[str], username: Optional[str], password: Optional[str]) -> Optional[str]:
+    if not server:
+        return None
+    if username and password and '://' in server:
+        scheme, rest = server.split('://', 1)
+        return f"{scheme}://{quote(username)}:{quote(password)}@{rest}"
+    return server
+
+def build_proxy_settings() -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, str]]]:
+    """构建 requests 与 Playwright 可用的代理配置。"""
+    server_with_auth = _build_requests_proxy_url(PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD)
+    requests_proxies = None
+    if server_with_auth:
+        requests_proxies = {
+            'http': server_with_auth,
+            'https': server_with_auth,
+        }
+    playwright_proxy = None
+    if PROXY_SERVER:
+        playwright_proxy = {
+            'server': PROXY_SERVER,
+        }
+        if PROXY_USERNAME and PROXY_PASSWORD:
+            playwright_proxy['username'] = PROXY_USERNAME
+            playwright_proxy['password'] = PROXY_PASSWORD
+    return playwright_proxy, requests_proxies
+
+def diagnose_connectivity(requests_proxies):
+    """输出网络连通性诊断信息，帮助定位“不能联网”的问题。"""
+    try:
+        linux_do_ip = socket.gethostbyname('linux.do')
+        logging.info(f"DNS 解析 linux.do -> {linux_do_ip}")
+    except Exception as e:
+        logging.warning(f"DNS 解析 linux.do 失败: {e}")
+    try:
+        r = requests.get('https://api.ipify.org?format=json', timeout=8, proxies=requests_proxies)
+        if r.ok:
+            logging.info(f"出口公网 IP: {r.json().get('ip')}")
+        else:
+            logging.warning(f"获取公网 IP 失败: {r.status_code}")
+    except Exception as e:
+        logging.warning(f"获取公网 IP 异常: {e}")
+    try:
+        r = requests.get(HOME_URL, timeout=12, proxies=requests_proxies)
+        logging.info(f"直连 {HOME_URL} 返回: {r.status_code}")
+    except Exception as e:
+        logging.warning(f"直连 {HOME_URL} 失败: {e}")
 
 # 检查必要配置
 missing_configs = []
@@ -124,13 +181,73 @@ class LinuxDoBrowser:
     def __init__(self) -> None:
         logging.info("启动 Playwright...")
         self.pw = sync_playwright().start()
-        logging.info("以无头模式启动 Firefox...")
-        self.browser = self.pw.firefox.launch(headless=True)
-        self.context = self.browser.new_context()
+        playwright_proxy, requests_proxies = build_proxy_settings()
+        self.requests_proxies = requests_proxies
+        diagnose_connectivity(self.requests_proxies)
+        logging.info(f"以无头模式启动 {BROWSER.capitalize()}...")
+        launch_kwargs = { 'headless': True }
+        if playwright_proxy:
+            launch_kwargs['proxy'] = playwright_proxy
+        browser_launcher = getattr(self.pw, BROWSER, None)
+        if not browser_launcher:
+            logging.warning(f"未知浏览器 {BROWSER}，回退到 firefox")
+            browser_launcher = self.pw.firefox
+        self.browser = browser_launcher.launch(**launch_kwargs)
+        context_kwargs = {
+            'timezone_id': 'Asia/Shanghai',
+            'locale': 'zh-CN',
+            'user_agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            ),
+        }
+        if playwright_proxy:
+            context_kwargs['proxy'] = playwright_proxy
+        self.context = self.browser.new_context(**context_kwargs)
+        # 基础反检测
+        self.context.add_init_script(
+            """
+            // 隐藏 webdriver 标记
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // 添加 window.chrome 对象
+            window.chrome = { runtime: {} };
+            // 语言和插件
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+            """
+        )
         self.page = self.context.new_page()
         logging.info(f"导航到 {HOME_URL}...")
-        self.page.goto(HOME_URL)
+        self.page.goto(HOME_URL, timeout=30000, wait_until='domcontentloaded')
+        self.wait_for_site_ready()
         logging.info("初始化完成。")
+
+    def wait_for_site_ready(self, timeout_seconds: int = 45) -> None:
+        """等待首页可交互，处理可能的挑战页/重定向。"""
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                if self.page.locator('.login-button .d-button-label').first.is_visible():
+                    return
+            except Exception:
+                pass
+            content_sample = ''
+            try:
+                content_sample = (self.page.content() or '')[:2000]
+            except Exception:
+                pass
+            if 'Just a moment' in content_sample or 'Attention Required' in content_sample or 'cf-browser-verification' in content_sample:
+                logging.info('检测到挑战页，继续等待通过...')
+                self.page.wait_for_timeout(2000)
+                continue
+            # 轻微等待后重试
+            self.page.wait_for_timeout(1000)
+        logging.warning('首页未在预期时间内就绪，尝试刷新一次...')
+        try:
+            self.page.reload(wait_until='domcontentloaded', timeout=20000)
+        except Exception:
+            pass
 
     def load_messages(self, filename):
         """从指定的文件加载消息并返回消息列表。"""
@@ -147,15 +264,19 @@ class LinuxDoBrowser:
     def login(self) -> bool:
         try:
             logging.info("尝试登录...")
+            self.page.wait_for_selector(".login-button .d-button-label", timeout=15000)
             self.page.click(".login-button .d-button-label")
             time.sleep(2)
+            self.page.wait_for_selector("#login-account-name", timeout=15000)
             self.page.fill("#login-account-name", USERNAME)
             time.sleep(2)
+            self.page.wait_for_selector("#login-account-password", timeout=15000)
             self.page.fill("#login-account-password", PASSWORD)
             time.sleep(2)
             self.page.click("#login-button")
-            time.sleep(10)  # 等待页面加载完成
-            user_ele = self.page.query_selector("#current-user")
+            # 等待最多 30s 观察登录后的用户元素
+            self.page.wait_for_timeout(5000)
+            user_ele = self.page.wait_for_selector("#current-user", timeout=25000)
             if not user_ele:
                 logging.error("登录失败，请检查账号密码及是否关闭二次认证")
                 return False
@@ -329,7 +450,7 @@ class LinuxDoBrowser:
     def print_connect_info(self):
         try:
             logging.info(f"导航到 {CONNECT_URL}...")
-            self.page.goto(CONNECT_URL)
+            self.page.goto(CONNECT_URL, timeout=30000)
             time.sleep(2)
             logging.info(f"当前页面URL: {self.page.url}")
             time.sleep(2)
@@ -445,12 +566,12 @@ class LinuxDoBrowser:
     def logout(self):
         try:
             logging.info(f"导航到 {HOME_URL}...")
-            self.page.goto(HOME_URL)
+            self.page.goto(HOME_URL, timeout=30000)
             time.sleep(2)
 
             # 点击用户菜单按钮以显示下拉菜单
             logging.info("尝试找到并点击用户菜单按钮...")
-            self.page.wait_for_selector("#current-user .icon", timeout=2000)
+            self.page.wait_for_selector("#current-user .icon", timeout=15000)
             user_menu_button = self.page.locator("#current-user .icon").first
             if user_menu_button:
                 user_menu_button.click()
@@ -463,7 +584,7 @@ class LinuxDoBrowser:
 
             # 点击“个人资料”标签
             logging.info("尝试找到并点击个人资料标签...")
-            self.page.wait_for_selector("#user-menu-button-profile", timeout=2000)
+            self.page.wait_for_selector("#user-menu-button-profile", timeout=15000)
             profile_tab_button = self.page.locator("#user-menu-button-profile").first
             if profile_tab_button:
                 profile_tab_button.click()
@@ -476,7 +597,7 @@ class LinuxDoBrowser:
 
             # 定位并点击退出按钮
             logging.info("尝试找到并点击退出按钮...")
-            self.page.wait_for_selector(".logout .btn", timeout=2000)
+            self.page.wait_for_selector(".logout .btn", timeout=15000)
             logout_button = self.page.locator(".logout .btn").first
             if logout_button:
                 logout_button.click()

@@ -23,8 +23,9 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install playwright requests tabulate configparser
-        playwright install
+        python -m pip install --upgrade pip
+        python -m pip install playwright requests tabulate configparser
+        python -m playwright install --with-deps
 
     - name: Run script
       env:
@@ -38,5 +39,9 @@ jobs:
         USE_WXPUSHER: ${{ secrets.USE_WXPUSHER }}
         APP_TOKEN: ${{ secrets.APP_TOKEN }}
         TOPIC_ID: ${{ secrets.TOPIC_ID }}
+        PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+        PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+        PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+        BROWSER: ${{ vars.BROWSER }}
       run: |
         python main.py
