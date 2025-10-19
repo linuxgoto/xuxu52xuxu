@@ -16,7 +16,7 @@ from tabulate import tabulate
 from playwright.sync_api import sync_playwright, TimeoutError
 from config import reply_generator
 
-# I stumbled upon this site thinking it might be a promising open-source Linux community. After exploring a bit, it seems like it's still in its early stages and doesn't quite live up to the 'community' label yet. There’s no shortage of overconfident individuals here, but it feels more like an amateurish forum rather than a serious place for Linux enthusiasts.
+# I stumbled upon this site thinking it might be a promising open-source Linux community. After exploring a bit, it seems like it's still in its early stages and doesn't quite live up to the 'community' label yet. There's no shortage of overconfident individuals here, but it feels more like an amateurish forum rather than a serious place for Linux enthusiasts.
 
 # 创建一个 StringIO 对象用于捕获日志
 log_stream = io.StringIO()
@@ -111,7 +111,7 @@ def build_proxy_settings() -> Tuple[Optional[Dict[str, str]], Optional[Dict[str,
     return playwright_proxy, requests_proxies
 
 def diagnose_connectivity(requests_proxies):
-    """输出网络连通性诊断信息，帮助定位“不能联网”的问题。"""
+    """输出网络连通性诊断信息，帮助定位"不能联网"的问题。"""
     try:
         linux_do_ip = socket.gethostbyname('linux.do')
         logging.info(f"DNS 解析 linux.do -> {linux_do_ip}")
@@ -205,49 +205,187 @@ class LinuxDoBrowser:
         if playwright_proxy:
             context_kwargs['proxy'] = playwright_proxy
         self.context = self.browser.new_context(**context_kwargs)
-        # 基础反检测
+        
+        # 增强反检测和Cloudflare绕过
         self.context.add_init_script(
             """
             // 隐藏 webdriver 标记
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            // 添加 window.chrome 对象
-            window.chrome = { runtime: {} };
+            
+            // 添加完整的 window.chrome 对象
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+            
             // 语言和插件
             Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+            Object.defineProperty(navigator, 'plugins', { get: () => {
+                return {
+                    length: 3,
+                    0: { name: 'Chrome PDF Plugin' },
+                    1: { name: 'Chrome PDF Viewer' },
+                    2: { name: 'Native Client' }
+                };
+            }});
+            
+            // 模拟真实的权限API
+            if (window.navigator.permissions && window.navigator.permissions.query) {
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+            }
+            
+            // 隐藏自动化相关属性
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+            
+            // 模拟真实的用户代理数据
+            Object.defineProperty(navigator, 'userAgentData', {
+                get: () => ({
+                    brands: [
+                        { brand: 'Google Chrome', version: '124' },
+                        { brand: 'Chromium', version: '124' },
+                        { brand: 'Not-A.Brand', version: '99' }
+                    ],
+                    mobile: false,
+                    platform: 'Windows'
+                })
+            });
             """
         )
+        
         self.page = self.context.new_page()
+        
+        # 添加额外的请求头以更好地模拟真实浏览器
+        self.page.set_extra_http_headers({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Sec-Ch-Ua': '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1'
+        })
+        
         logging.info(f"导航到 {HOME_URL}...")
-        self.page.goto(HOME_URL, timeout=30000, wait_until='domcontentloaded')
+        try:
+            self.page.goto(HOME_URL, timeout=45000, wait_until='domcontentloaded')
+        except Exception as e:
+            logging.warning(f'首次导航失败: {e}，尝试重新导航...')
+            time.sleep(3)
+            self.page.goto(HOME_URL, timeout=45000, wait_until='domcontentloaded')
+            
         self.wait_for_site_ready()
         logging.info("初始化完成。")
 
-    def wait_for_site_ready(self, timeout_seconds: int = 45) -> None:
+    def wait_for_site_ready(self, timeout_seconds: int = 60) -> None:
         """等待首页可交互，处理可能的挑战页/重定向。"""
         deadline = time.time() + timeout_seconds
+        challenge_detected = False
+        
         while time.time() < deadline:
             try:
-                if self.page.locator('.login-button .d-button-label').first.is_visible():
+                # 检查是否已经可以看到登录按钮
+                if self.page.locator('.login-button .d-button-label').first.is_visible(timeout=1000):
+                    logging.info('页面已就绪，可以进行登录操作')
                     return
             except Exception:
                 pass
+                
+            # 获取页面内容进行检查
             content_sample = ''
+            title = ''
             try:
-                content_sample = (self.page.content() or '')[:2000]
+                content_sample = (self.page.content() or '')[:3000]
+                title = self.page.title() or ''
             except Exception:
                 pass
-            if 'Just a moment' in content_sample or 'Attention Required' in content_sample or 'cf-browser-verification' in content_sample:
-                logging.info('检测到挑战页，继续等待通过...')
+                
+            # 检测各种Cloudflare挑战页面
+            cf_indicators = [
+                'Just a moment',
+                'Attention Required', 
+                'cf-browser-verification',
+                'Checking your browser',
+                'Please wait while we check your browser',
+                'DDoS protection by Cloudflare',
+                'Ray ID:',
+                'cloudflare',
+                'cf-challenge'
+            ]
+            
+            if any(indicator in content_sample.lower() or indicator in title.lower() for indicator in cf_indicators):
+                if not challenge_detected:
+                    logging.info('检测到Cloudflare挑战页面，等待自动通过...')
+                    challenge_detected = True
+                
+                # 模拟人类行为 - 随机移动鼠标
+                try:
+                    self.page.mouse.move(random.randint(100, 800), random.randint(100, 600))
+                    self.page.wait_for_timeout(random.randint(1000, 3000))
+                except Exception:
+                    pass
+                    
+                # 检查是否有需要点击的验证按钮
+                try:
+                    # 寻找可能的验证按钮
+                    verify_selectors = [
+                        'input[type="button"][value*="Verify"]',
+                        'button[type="submit"]',
+                        '.cf-button',
+                        '#challenge-form button',
+                        'button:has-text("Verify you are human")',
+                        'button:has-text("Continue")',
+                        'input[value="Continue"]'
+                    ]
+                    
+                    for selector in verify_selectors:
+                        try:
+                            if self.page.locator(selector).first.is_visible(timeout=500):
+                                logging.info(f'找到验证按钮: {selector}，尝试点击')
+                                self.page.locator(selector).first.click(timeout=2000)
+                                self.page.wait_for_timeout(3000)
+                                break
+                        except Exception:
+                            continue
+                            
+                except Exception:
+                    pass
+                    
                 self.page.wait_for_timeout(2000)
                 continue
-            # 轻微等待后重试
+                
+            # 检查是否遇到其他错误页面
+            if any(error in content_sample.lower() for error in ['error', '403', '503', 'access denied']):
+                logging.warning(f'检测到错误页面，当前URL: {self.page.url}')
+                
+            # 如果没有检测到挑战页面，等待一下再重试
             self.page.wait_for_timeout(1000)
-        logging.warning('首页未在预期时间内就绪，尝试刷新一次...')
+            
+        # 超时后尝试刷新页面
+        logging.warning('页面未在预期时间内就绪，尝试刷新页面...')
         try:
-            self.page.reload(wait_until='domcontentloaded', timeout=20000)
-        except Exception:
-            pass
+            self.page.reload(wait_until='domcontentloaded', timeout=30000)
+            self.page.wait_for_timeout(5000)
+            # 再次检查登录按钮
+            if self.page.locator('.login-button .d-button-label').first.is_visible(timeout=5000):
+                logging.info('刷新后页面已就绪')
+                return
+        except Exception as e:
+            logging.error(f'刷新页面时出错: {e}')
 
     def load_messages(self, filename):
         """从指定的文件加载消息并返回消息列表。"""
@@ -264,27 +402,120 @@ class LinuxDoBrowser:
     def login(self) -> bool:
         try:
             logging.info("尝试登录...")
-            self.page.wait_for_selector(".login-button .d-button-label", timeout=15000)
-            self.page.click(".login-button .d-button-label")
-            time.sleep(2)
-            self.page.wait_for_selector("#login-account-name", timeout=15000)
-            self.page.fill("#login-account-name", USERNAME)
-            time.sleep(2)
-            self.page.wait_for_selector("#login-account-password", timeout=15000)
-            self.page.fill("#login-account-password", PASSWORD)
-            time.sleep(2)
-            self.page.click("#login-button")
-            # 等待最多 30s 观察登录后的用户元素
-            self.page.wait_for_timeout(5000)
-            user_ele = self.page.wait_for_selector("#current-user", timeout=25000)
-            if not user_ele:
-                logging.error("登录失败，请检查账号密码及是否关闭二次认证")
+            
+            # 再次确认页面已就绪
+            self.wait_for_site_ready(30)
+            
+            # 模拟人类行为 - 随机移动鼠标
+            self.page.mouse.move(random.randint(200, 600), random.randint(200, 400))
+            time.sleep(random.uniform(1, 2))
+            
+            # 等待并点击登录按钮
+            logging.info("寻找登录按钮...")
+            login_button = self.page.wait_for_selector(".login-button .d-button-label", timeout=20000)
+            if not login_button:
+                logging.error("未找到登录按钮")
                 return False
-            else:
-                logging.info("登录成功")
-                return True
+                
+            # 模拟人类点击行为
+            self.page.mouse.move(random.randint(100, 300), random.randint(100, 300))
+            time.sleep(random.uniform(0.5, 1.5))
+            login_button.click()
+            logging.info("已点击登录按钮")
+            
+            # 等待登录表单出现
+            time.sleep(random.uniform(2, 4))
+            
+            # 输入用户名
+            logging.info("输入用户名...")
+            username_field = self.page.wait_for_selector("#login-account-name", timeout=15000)
+            if not username_field:
+                logging.error("未找到用户名输入框")
+                return False
+                
+            # 模拟人类输入行为
+            username_field.click()
+            time.sleep(random.uniform(0.5, 1))
+            username_field.fill("")
+            time.sleep(random.uniform(0.2, 0.5))
+            
+            # 逐字符输入用户名以模拟真实输入
+            for char in USERNAME:
+                username_field.type(char)
+                time.sleep(random.uniform(0.05, 0.15))
+                
+            time.sleep(random.uniform(1, 2))
+            
+            # 输入密码
+            logging.info("输入密码...")
+            password_field = self.page.wait_for_selector("#login-account-password", timeout=15000)
+            if not password_field:
+                logging.error("未找到密码输入框")
+                return False
+                
+            password_field.click()
+            time.sleep(random.uniform(0.5, 1))
+            password_field.fill("")
+            time.sleep(random.uniform(0.2, 0.5))
+            
+            # 逐字符输入密码
+            for char in PASSWORD:
+                password_field.type(char)
+                time.sleep(random.uniform(0.05, 0.15))
+                
+            time.sleep(random.uniform(1, 3))
+            
+            # 点击登录提交按钮
+            logging.info("提交登录表单...")
+            submit_button = self.page.wait_for_selector("#login-button", timeout=10000)
+            if not submit_button:
+                logging.error("未找到登录提交按钮")
+                return False
+                
+            submit_button.click()
+            logging.info("已提交登录表单")
+            
+            # 等待登录结果，可能需要处理额外的验证
+            time.sleep(5)
+            
+            # 检查是否出现了额外的验证挑战
+            for i in range(3):  # 最多重试3次
+                try:
+                    content = self.page.content()
+                    if any(indicator in content.lower() for indicator in ['just a moment', 'checking', 'verify', 'challenge']):
+                        logging.info(f"检测到登录后的验证挑战，等待通过... (尝试 {i+1}/3)")
+                        time.sleep(10)
+                        continue
+                    break
+                except Exception:
+                    time.sleep(5)
+                    
+            # 等待用户元素出现，表示登录成功
+            logging.info("等待登录完成...")
+            try:
+                user_ele = self.page.wait_for_selector("#current-user", timeout=30000)
+                if user_ele and user_ele.is_visible():
+                    logging.info("登录成功")
+                    return True
+                else:
+                    logging.error("登录失败，未找到用户元素")
+                    return False
+            except TimeoutError:
+                # 检查是否仍在挑战页面
+                current_url = self.page.url
+                content = self.page.content()
+                if any(indicator in content.lower() for indicator in ['challenge', 'verify', 'checking']):
+                    logging.error("登录失败：仍在验证挑战页面")
+                else:
+                    logging.error("登录失败：等待用户元素超时")
+                logging.info(f"当前URL: {current_url}")
+                return False
+                
         except TimeoutError:
             logging.error("登录失败：页面加载超时或元素未找到")
+            return False
+        except Exception as e:
+            logging.error(f"登录过程中出现异常: {e}")
             return False
 
     def click_topic(self):
@@ -582,7 +813,7 @@ class LinuxDoBrowser:
 
             time.sleep(2)  # 确保菜单展开
 
-            # 点击“个人资料”标签
+            # 点击"个人资料"标签
             logging.info("尝试找到并点击个人资料标签...")
             self.page.wait_for_selector("#user-menu-button-profile", timeout=15000)
             profile_tab_button = self.page.locator("#user-menu-button-profile").first
