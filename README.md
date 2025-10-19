@@ -66,6 +66,7 @@
 - APP_TOKEN: wxpusher 应用的 appToken，当 USE_WXPUSHER 为 true 时需要配置。
 - TOPIC_ID: wxpusher 的 topicId，当 USE_WXPUSHER 为 true 时需要配置。
 - MAX_TOPICS: 最大处理的主题数量，如果超过此数量则只处理前 MAX_TOPICS 个主题。
+- BROWSER: 选择浏览器，可选 `firefox`、`chromium`、`webkit`，默认 `firefox`。
 
 ## 一、在 Windows 上配置与运行
 
@@ -157,6 +158,11 @@ export LINUXDO_PASSWORD="your_password"
 export USE_WXPUSHER=true
 export APP_TOKEN="your_app_token"
 export TOPIC_ID="your_topic_id"
+# 可选：代理与浏览器
+export PROXY_SERVER="http://127.0.0.1:7890"
+export PROXY_USERNAME=""
+export PROXY_PASSWORD=""
+export BROWSER="chromium"
 ```
 
 使配置生效：
